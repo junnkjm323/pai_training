@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import argparse
 import numpy as np
 import torch
 from pathlib import Path
@@ -31,6 +32,7 @@ class RosbagToLeRobot:
             robot_type = getattr(config, "robot_type", "crane_plus")
             repo_id = getattr(config, "repo_id", "teleop_rosbag_dataset")
             task_name = getattr(config, "task_name", "teleop")
+            topics = config
         else:
             # YAML fallback
             with open(config_path, 'r') as f:
@@ -39,8 +41,15 @@ class RosbagToLeRobot:
             robot_type = config.get('robot_type', 'crane_plus')
             repo_id = config.get('repo_id', 'teleop_rosbag_dataset')
             task_name = config.get('task_name', 'teleop')
+            topics = argparse.Namespace(**config)
 
         self.task_name = task_name
+        # Topic names default to CRANE+; a features config can override them (see so101_features.py).
+        self.state_topic = getattr(topics, 'state_topic', '/joint_states')
+        self.state_joint_names = getattr(topics, 'state_joint_names', None)  # None: keep /joint_states order
+        self.arm_topic = getattr(topics, 'arm_command_topic', '/crane_plus_arm_controller/joint_trajectory')
+        self.gripper_topic = getattr(topics, 'gripper_command_topic', '/crane_plus_gripper_controller/joint_trajectory')
+        self.env_topic = getattr(topics, 'environment_state_topic', None)  # None: copy of the joint state
 
         # --- Dataset creation with user prompt if dir exists ---
         while True:
@@ -74,11 +83,9 @@ class RosbagToLeRobot:
 
     def _get_messages(self, episode_dir):
         """Get messages from all required topics in the rosbag."""
-        messages = {
-            '/joint_states': [],
-            '/crane_plus_arm_controller/joint_trajectory': [],
-            '/crane_plus_gripper_controller/joint_trajectory': [],
-        }
+        messages = {self.state_topic: [], self.arm_topic: [], self.gripper_topic: []}
+        if self.env_topic:
+            messages[self.env_topic] = []
         with Reader(episode_dir) as reader:
             connections = [x for x in reader.connections if x.topic in messages.keys()]
             for connection, timestamp, rawdata in reader.messages(connections=connections):
@@ -111,9 +118,9 @@ class RosbagToLeRobot:
         for episode_dir in self.episode_dirs:
             try:
                 messages = self._get_messages(episode_dir)
-                j_times = np.array([ts for _, ts in messages['/joint_states']])
-                a_times = np.array([ts for _, ts in messages['/crane_plus_arm_controller/joint_trajectory']])
-                g_times = np.array([ts for _, ts in messages['/crane_plus_gripper_controller/joint_trajectory']])
+                j_times = np.array([ts for _, ts in messages[self.state_topic]])
+                a_times = np.array([ts for _, ts in messages[self.arm_topic]])
+                g_times = np.array([ts for _, ts in messages[self.gripper_topic]])
                 # Use the intersection of available times
                 start_time = max(j_times[0], a_times[0], g_times[0])
                 end_time = min(j_times[-1], a_times[-1], g_times[-1])
@@ -133,11 +140,15 @@ class RosbagToLeRobot:
             print(f"\nProcessing episode {idx} from {episode_dir}...")
             try:
                 messages = self._get_messages(episode_dir)
-                joint_states = messages['/joint_states']
-                arm_cmds = messages['/crane_plus_arm_controller/joint_trajectory']
-                gripper_cmds = messages['/crane_plus_gripper_controller/joint_trajectory']
+                joint_states = messages[self.state_topic]
+                arm_cmds = messages[self.arm_topic]
+                gripper_cmds = messages[self.gripper_topic]
                 j_times = np.array([ts for _, ts in joint_states])
-                j_pos = np.array([msg.position for msg, _ in joint_states])
+                if self.state_joint_names:
+                    j_pos = np.array([[dict(zip(msg.name, msg.position))[n] for n in self.state_joint_names]
+                                      for msg, _ in joint_states])
+                else:
+                    j_pos = np.array([msg.position for msg, _ in joint_states])
                 a_times = np.array([ts for _, ts in arm_cmds])
                 a_pos = np.array([msg.points[0].positions if msg.points else [0,0,0,0] for msg, _ in arm_cmds])
                 g_times = np.array([ts for _, ts in gripper_cmds])
@@ -151,13 +162,20 @@ class RosbagToLeRobot:
                 j_pos_sampled = self._sample_and_hold(j_times, j_pos, target_times)  # (num_frames, 5)
                 a_pos_sampled = self._sample_and_hold(a_times, a_pos, target_times)  # (num_frames, 4)
                 g_pos_sampled = self._sample_and_hold(g_times, g_pos, target_times)  # (num_frames,)
+                if self.env_topic:
+                    e_msgs = messages[self.env_topic]
+                    e_times = np.array([ts for _, ts in e_msgs])
+                    e_pos = np.array([[msg.point.x, msg.point.y, msg.point.z] for msg, _ in e_msgs])
+                    env_sampled = self._sample_and_hold(e_times, e_pos, target_times)
+                else:
+                    env_sampled = j_pos_sampled
                 # Concatenate after sampling
                 a_pos_full = np.hstack([a_pos_sampled, g_pos_sampled.reshape(-1,1)])  # (num_frames, 5)
                 for i in range(max_frames):
                     idx_to_use = min(i, num_frames - 1)
                     self.dataset.add_frame({
                         "observation.state": torch.tensor(j_pos_sampled[idx_to_use], dtype=torch.float32),
-                        "observation.environment_state": torch.tensor(j_pos_sampled[idx_to_use], dtype=torch.float32),
+                        "observation.environment_state": torch.tensor(env_sampled[idx_to_use], dtype=torch.float32),
                         "action": torch.tensor(a_pos_full[idx_to_use], dtype=torch.float32),
                         "task": self.task_name,
                     })
@@ -178,8 +196,11 @@ def load_config_py(config_path):
     return config
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', default='configs/conversion_config.yaml')
+    args = parser.parse_args()
     # Load parameters from conversion_config.yaml
-    with open("configs/conversion_config.yaml", "r") as f:
+    with open(args.config, "r") as f:
         conv_cfg = yaml.safe_load(f)
     bag_dir = conv_cfg["bag_dir"]
     output_dir = conv_cfg["output_dir"]

@@ -1,0 +1,28 @@
+# SO-101 leader arm reader (LeRobot 0.4.1, Python 3.10, runs in the container).
+# A separate pixi workspace on purpose: the repo's default env pins the old lerobot submodule
+# (lerobot.common.* layout, no SO-101 teleoperator), and adding an environment to the root
+# pyproject.toml makes pixi re-solve and upgrade that training env.
+#
+#   cd sim/so101/leader && pixi install
+#   pixi run lerobot-find-port
+#   pixi run lerobot-setup-motors --teleop.type=so101_leader --teleop.port=/dev/ttyACM0
+#   pixi run lerobot-calibrate --teleop.type=so101_leader --teleop.port=/dev/ttyACM0 --teleop.id=so101_leader
+#   pixi run send --port /dev/ttyACM0
+[workspace]
+name = "so101_leader"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = "3.10.*"
+
+[pypi-dependencies]
+lerobot = { version = "==0.4.1", extras = ["feetech"] }
+
+[activation.env]
+# Keep the leader calibration in the repo instead of ~/.cache inside the container,
+# so it survives recreating the container.
+HF_LEROBOT_CALIBRATION = "$PIXI_PROJECT_ROOT/calibration"
+
+[tasks]
+send = { cmd = "python ../so101_leader_bridge.py send" }

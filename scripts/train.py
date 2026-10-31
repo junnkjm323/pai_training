@@ -24,11 +24,13 @@ This script trains an ACT policy using configuration parameters specified in:
 
 Usage:
     pixi run train
+    pixi run train --config configs/so101_train_config.yaml
 
 """
 
 
 from pathlib import Path
+import argparse
 import importlib.util
 import wandb
 import torch
@@ -52,7 +54,9 @@ def load_train_config(yaml_path: Path):
 # =====================
 # Load parameters from YAML
 # =====================
-train_cfg = load_train_config("configs/train_config.yaml")
+_parser = argparse.ArgumentParser()
+_parser.add_argument("--config", default="configs/train_config.yaml")
+train_cfg = load_train_config(_parser.parse_args().config)
 DATASET_ROOT = Path(train_cfg["dataset_root"])
 REPO_ID = train_cfg["repo_id"]
 OUTPUT_DIRECTORY = Path(train_cfg["output_directory"])
@@ -66,6 +70,7 @@ CHUNK_SIZE = train_cfg["chunk_size"]
 N_ACTION_STEPS = train_cfg["n_action_steps"]
 LEARNING_RATE = train_cfg["learning_rate"]
 DELTA_TIMESTAMPS = train_cfg["delta_timestamps"]
+WANDB_PROJECT = train_cfg.get("wandb_project", "pai_crane_gazebo")
 # =====================
 
 def main():
@@ -75,7 +80,7 @@ def main():
     config = load_config_py(CONFIG_PATH)
     features = config.features
 
-    wandb.init(project="pai_crane_gazebo", config={
+    wandb.init(project=WANDB_PROJECT, config={
         "repo_id": REPO_ID,
         "dataset_root": DATASET_ROOT,
         "training_steps": TRAINING_STEPS,
