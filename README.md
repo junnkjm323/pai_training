@@ -116,7 +116,7 @@ docker build -t pai2026-so101 docker/
 # The parent directory is mounted so that data/ (bags, datasets, checkpoints) sits next to the repo.
 docker run -d --name pai2026-so101 --shm-size=512m \
   -v "$(dirname "$PWD")":/home/ubuntu/pai2026-final-assignment \
-  -p 127.0.0.1:6080:80 -p 127.0.0.1:5005:5005/udp -p 127.0.0.1:9090:9090 \
+  -p 127.0.0.1:6080:80 -p 127.0.0.1:5005:5005/udp -p 127.0.0.1:9090:9090 -p 127.0.0.1:9876:9876 \
   --device-cgroup-rule='c 166:* rmw' --device-cgroup-rule='c 188:* rmw' \
   -v /dev:/hostdev:ro \
   pai2026-so101
@@ -160,6 +160,18 @@ pixi run infer --model-path ../data/checkpoints/so101_reach_act --config configs
 python3 sim/so101/so101_reach.py eval --episodes 20 --seed 100   # the policy only acts while /reach_active is true
 ```
 Bags, datasets and checkpoints go to `../data/` (outside the repo).
+
+Reach over a wall (`--wall`): a wall stands between the tucked home pose and most targets, so the arm has to go over
+it; touching it (checked kinematically along the links) fails the episode. Same pipeline with the `so101_wall` configs:
+```bash
+python3 sim/so101/so101_reach.py record --wall --demo --episodes 100 --seed 0   # planner inserts via-points over the wall
+pixi run convert --config configs/so101_wall_conversion_config.yaml
+WANDB_MODE=disabled pixi run train --config configs/so101_wall_train_config.yaml
+pixi run infer --model-path ../data/checkpoints/so101_wall_act --config configs/so101_wall_features.py
+python3 sim/so101/so101_reach.py eval --wall --episodes 20 --seed 100
+python3 sim/so101/so101_reach.py eval --wall --baseline direct --episodes 20 --seed 100    # no policy: straight move
+python3 sim/so101/so101_reach.py eval --wall --baseline planner --episodes 20 --seed 100   # no policy: the planner
+```
 
 ### Notes
 - Gazebo has no GPU in the container and runs below real time (about 40 % on the development machine), while

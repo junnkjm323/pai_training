@@ -15,4 +15,4 @@ learning_rate: 0.0001
 delta_timestamps:
   observation.environment_state: [0.0]
   observation.state: [0.0]
-  action: [-0.1, 0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4]
+  action: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5]  # current frame onward (lecture 5, p.49)

@@ -1,0 +1,18 @@
+dataset_root: "/home/ubuntu/pai2026-final-assignment/data/lerobot_dataset/so101_wall"
+repo_id: "so101_wall"
+output_directory: "/home/ubuntu/pai2026-final-assignment/data/checkpoints/so101_wall_act"
+config_path: "configs/so101_wall_features.py"
+wandb_project: "pai_so101_gazebo"
+
+device: "cpu"
+training_steps: 5000
+log_freq: 50
+num_workers: 2
+batch_size: 32
+chunk_size: 16
+n_action_steps: 1
+learning_rate: 0.0001
+delta_timestamps:
+  observation.environment_state: [0.0]
+  observation.state: [0.0]
+  action: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5]  # current frame onward (lecture 5, p.49)
