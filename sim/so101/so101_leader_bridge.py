@@ -89,9 +89,14 @@ def run_send(args):
     signs = [float(s) for s in args.signs.split(',')]
     offsets = [float(o) for o in args.offsets.split(',')]
     g_lo, g_hi = LIMITS['gripper']
+    calls = [0]
 
     def sample():
         action = leader.get_action()
+        if args.show_raw and calls[0] % args.rate == 0:
+            # For checking directions: move one leader joint and compare with the Gazebo arm.
+            print('raw LeRobot: ' + ' '.join(f'{n}={action[f"{n}.pos"]:+7.1f}' for n in JOINT_NAMES))
+        calls[0] += 1
         out = []
         for i, name in enumerate(ARM_JOINTS):
             # LeRobot body joints are in degrees (use_degrees=True).
@@ -183,6 +188,7 @@ def main():
     parser.add_argument('--id', default='so101_leader', help='LeRobot calibration id (send)')
     parser.add_argument('--signs', default='1,1,1,1,1,1', help='per-joint sign, LeRobot -> URDF (send)')
     parser.add_argument('--offsets', default='0,0,0,0,0,0', help='per-joint offset [rad] after sign (send)')
+    parser.add_argument('--show-raw', action='store_true', help='also print the raw LeRobot values once a second (send)')
     parser.add_argument('--horizon', type=float, default=0.0, help='time_from_start of each command [s] (ros)')
     parser.add_argument('--timeout', type=float, default=0.5, help='stop commanding after this silence [s] (ros)')
     args = parser.parse_args()

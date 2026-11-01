@@ -1,0 +1,5 @@
+# Scripted-demonstrator dataset (so101_reach.py record --wall --demo); the teleop dataset uses so101_wall_*.
+bag_dir: "/home/ubuntu/pai2026-final-assignment/data/rosbags/so101_wall_script"
+output_dir: "/home/ubuntu/pai2026-final-assignment/data/lerobot_dataset/so101_wall_script"
+config: "configs/so101_wall_features.py"
+target_freq: 20

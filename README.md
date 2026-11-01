@@ -148,10 +148,13 @@ cd sim/so101/leader
 pixi run lerobot-setup-motors --teleop.type=so101_leader --teleop.port=/hostdev/ttyACM0
 pixi run lerobot-calibrate --teleop.type=so101_leader --teleop.port=/hostdev/ttyACM0 --teleop.id=so101_leader
 pixi run send --port /hostdev/ttyACM0                 # --signs/--offsets map LeRobot angles onto the URDF joints
+# Direction check: run with --show-raw, move one leader joint at a time and compare with the Gazebo arm;
+# flip that joint's entry in --signs if it moves the other way (both use "zero = middle of the range").
 ```
 Record, replay, train, evaluate:
 ```bash
-python3 sim/so101/so101_reach.py record --episodes 20          # human with the leader; return to home between episodes
+python3 sim/so101/so101_reach.py record --wall --episodes 30  # human with the leader: the console says which joint
+                                                              # is off home; the bag starts when the leader starts moving
 python3 sim/so101/so101_reach.py record --demo --episodes 50 --seed 0   # scripted demonstrator instead
 python3 sim/so101/so101_reach.py replay ../data/rosbags/so101_reach/episode_000   # metrics -> episodes.jsonl
 pixi run convert --config configs/so101_conversion_config.yaml

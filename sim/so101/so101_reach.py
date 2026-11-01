@@ -18,6 +18,8 @@ Modes (run inside the container with ROS sourced, Gazebo + so101_leader_bridge.p
     eval --baseline direct|planner   same episodes, driven by a straight joint-space move or by the
                       demonstrator's planner over UDP instead of a policy (bridge required)
     fk                print the tip position for the given joints (debugging)
+    summary LABEL=FILE...  success / wall-contact table (per target kind) from episodes.jsonl files,
+                      --plot PNG for a bar chart (use one --out directory per evaluated method)
 
 Bags go to <out>/episode_XXX (sqlite3); one JSON line per episode is appended to <out>/episodes.jsonl.
 """
@@ -183,7 +185,9 @@ def plan_path(q0, q1):
         q_over, err = ik([WALL_CENTER[0], far[1], top + clearance], seed=q1)
         if err > 0.005:
             continue
-        q_front, err_front = ik([WALL_CENTER[0] - 0.07, near[1], top + clearance], seed=q_over)
+        # Same side as the far point, so the arm already turns towards the target while rising and the
+        # via pose differs per target (a pose shared by all demos becomes an ambiguous state for the policy).
+        q_front, err_front = ik([WALL_CENTER[0] - 0.07, far[1], top + clearance], seed=q_over)
         candidates = [[q_over]]
         if err_front < 0.005:
             # Rise in front of the wall first when going out, come down in front of it when coming back.
@@ -229,6 +233,37 @@ def min_jerk(q0, q1, s):
     s = min(max(s, 0.0), 1.0)
     w = 10 * s ** 3 - 15 * s ** 4 + 6 * s ** 5
     return [a + (b - a) * w for a, b in zip(q0, q1)]
+
+
+def smooth_trajectory(q0, waypoints, durations, tangent_scale=1.0):
+    """f(t) through the waypoints without stopping at them: cubic Hermite segments with Catmull-Rom
+    tangents (scaled by tangent_scale), zero velocity only at the start and the end."""
+    times = np.concatenate([[0.0], np.cumsum(durations)])
+    points = np.array([list(q0)] + [list(w) for w in waypoints])
+    tangents = np.zeros_like(points)
+    for k in range(1, len(points) - 1):
+        tangents[k] = tangent_scale * (points[k + 1] - points[k - 1]) / (times[k + 1] - times[k - 1])
+
+    def f(t):
+        k = int(np.clip(np.searchsorted(times, t, side='right') - 1, 0, len(durations) - 1))
+        h = durations[k]
+        s = min(max((t - times[k]) / h, 0.0), 1.0)
+        h00, h10, h01, h11 = 2 * s**3 - 3 * s**2 + 1, s**3 - 2 * s**2 + s, -2 * s**3 + 3 * s**2, s**3 - s**2
+        return list(h00 * points[k] + h10 * h * tangents[k] + h01 * points[k + 1] + h11 * h * tangents[k + 1])
+    return f
+
+
+def demo_trajectory(q0, waypoints, durations):
+    """Trajectory for the scripted demonstrator: smooth through the via-points if that stays clear of the
+    wall (checked with PLAN_MARGIN), otherwise with smaller tangents, finally stopping at each via-point.
+    Stops teach the policy to stop (lecture 5: no pauses in demonstrations)."""
+    if len(waypoints) == 1:
+        return waypoint_trajectory(q0, waypoints, durations)
+    for scale in (1.0, 0.6, 0.3):
+        f = smooth_trajectory(q0, waypoints, durations, scale)
+        if not any(wall_collision(f(t), PLAN_MARGIN) for t in np.linspace(0, sum(durations), 120)):
+            return f
+    return waypoint_trajectory(q0, waypoints, durations)
 
 
 def waypoint_trajectory(q0, waypoints, durations):
@@ -437,8 +472,8 @@ def pick_target(rng, args):
 
 
 def segment_durations(rng, path):
-    # Human-like timing: one smooth move, or two shorter ones through the via-point.
-    return [rng.uniform(2.0, 3.5)] if len(path) == 1 else [rng.uniform(1.3, 2.0) for _ in path]
+    # Human-like timing: one smooth move, or shorter segments through the via-points.
+    return [rng.uniform(2.0, 3.5)] if len(path) == 1 else [rng.uniform(1.0, 1.6) for _ in path]
 
 
 def go_home(node, args):
@@ -458,8 +493,17 @@ def go_home(node, args):
             node.spin_for(0.05)
     elif args.mode == 'record':
         print('move the leader back to the home pose...')
+        last = 0.0
         while home_error() > args.home_tol:
+            if time.time() - last > 1.0:
+                # Tell the operator which joint is furthest from home and in which direction to move it.
+                errs = [b - a for a, b in zip(node.q[:5], home[:5])]
+                k = int(np.argmax(np.abs(errs)))
+                print(f'  home error {max(map(abs, errs)):.2f} rad, worst: {JOINT_NAMES[k]} '
+                      f'(move {"+" if errs[k] > 0 else "-"}{abs(errs[k]):.2f} rad)')
+                last = time.time()
             node.spin_for(0.1)
+        print('home reached')
         node.spin_for(0.5)
     else:
         node.command_direct(path, [1.5] * len(path))
@@ -478,17 +522,26 @@ def record(node, args):
         move_marker(target)
         node.target = target
         path = os.path.join(args.out, f'episode_{ep:03d}')
+        onset = 0.0
+        if not args.demo:
+            # A human reacts ~0.5 s after the target appears. Start the bag only once the leader moves,
+            # so the episode does not begin with a pause (the policy would learn to wait at home).
+            print(f'episode {ep}: target shown, move when ready')
+            t_show, q_show = time.time(), list(node.q)
+            while max(abs(a - b) for a, b in zip(node.q[:5], q_show[:5])) < args.onset_tol:
+                node.spin_for(0.02)
+            onset = time.time() - t_show
         node.open_bag(path)
         on_tick = None
         if args.demo:
-            delay = rng.uniform(0.3, 0.8)
-            traj = waypoint_trajectory(node.q, waypoints, segment_durations(rng, waypoints))
-            on_tick = lambda t: node.send_leader(traj(t - delay))
+            # Start right away and never pause: stops in demos are learned as stops (lecture 5).
+            traj = demo_trajectory(node.q, waypoints, segment_durations(rng, waypoints))
+            on_tick = lambda t: node.send_leader(traj(t))
         ok, t_reach, err, collided = node.wait_success(args.timeout, on_tick)
         node.spin_for(0.5)  # keep a little of the settled pose in the bag
         node.close_bag()
         node.target = None
-        log_episode(args.out, {'episode': ep, 'bag': path, 'demo': args.demo, 'kind': kind,
+        log_episode(args.out, {'episode': ep, 'bag': path, 'demo': args.demo, 'kind': kind, 'onset_delay': onset,
                                'via_point': len(waypoints) > 1, 'target': list(map(float, target)),
                                'success': ok, 'collided': collided, 'time_to_reach': t_reach, 'final_error': err})
 
@@ -504,7 +557,7 @@ def evaluate(node, args):
         if args.baseline:
             # Same targets, no policy: a straight joint-space move, or the demonstrator's planner.
             path = [q_goal] if args.baseline == 'direct' else waypoints
-            traj = waypoint_trajectory(node.q, path, [2.5] if len(path) == 1 else [1.6] * len(path))
+            traj = demo_trajectory(node.q, path, [2.5] if len(path) == 1 else [1.6] * len(path))
             on_tick = lambda t: node.send_leader(traj(t))
         node.target = target  # /reach_active goes true: the policy starts acting
         ok, t_reach, err, collided = node.wait_success(args.timeout, on_tick)
@@ -591,9 +644,44 @@ def rclpy_spin_once(node):
     rclpy.spin_once(node, timeout_sec=0.002)
 
 
+def summary(args):
+    rows = []
+    for spec in args.bags:
+        label, _, path = spec.rpartition('=')
+        entries = [json.loads(line) for line in open(path)]
+        label = label or os.path.basename(os.path.dirname(os.path.abspath(path)))
+        for kind in ['all'] + sorted({e.get('kind', 'reach') for e in entries}):
+            sel = [e for e in entries if kind == 'all' or e.get('kind', 'reach') == kind]
+            times = [e['time_to_reach'] for e in sel if e['success'] and e.get('time_to_reach') is not None]
+            rows.append({'label': label, 'kind': kind, 'n': len(sel),
+                         'success': sum(e['success'] for e in sel) / len(sel),
+                         'contact': sum(bool(e.get('collided')) for e in sel) / len(sel),
+                         'time_to_reach': float(np.mean(times)) if times else None})
+    print(f'{"method":<16}{"kind":<8}{"n":>4}{"success":>9}{"contact":>9}{"t_reach[s]":>12}')
+    for r in rows:
+        t = f'{r["time_to_reach"]:.2f}' if r['time_to_reach'] is not None else '-'
+        print(f'{r["label"]:<16}{r["kind"]:<8}{r["n"]:>4}{r["success"]:>9.0%}{r["contact"]:>9.0%}{t:>12}')
+    if args.plot:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        overall = [r for r in rows if r['kind'] == 'all']
+        x = np.arange(len(overall))
+        fig, ax = plt.subplots(figsize=(1.6 * len(overall) + 2, 3.2))
+        ax.bar(x - 0.2, [100 * r['success'] for r in overall], 0.4, label='success')
+        ax.bar(x + 0.2, [100 * r['contact'] for r in overall], 0.4, label='wall contact')
+        ax.set_xticks(x, [f'{r["label"]}\n(n={r["n"]})' for r in overall])
+        ax.set_ylabel('%')
+        ax.set_ylim(0, 105)
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(args.plot, dpi=150)
+        print('saved', args.plot)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('mode', choices=['record', 'replay', 'eval', 'fk'])
+    parser.add_argument('mode', choices=['record', 'replay', 'eval', 'fk', 'summary'])
     parser.add_argument('bags', nargs='*', help='episode bag dirs (replay) / joint values (fk)')
     parser.add_argument('--demo', action='store_true', help='scripted demonstrator instead of a human (record)')
     parser.add_argument('--wall', action='store_true', help='reach-over-the-wall task')
@@ -607,11 +695,17 @@ def main():
     parser.add_argument('--hold', type=float, default=0.5, help='time to stay within tol [s]')
     parser.add_argument('--timeout', type=float, default=15.0, help='episode timeout [s]')
     parser.add_argument('--home-tol', type=float, default=0.15, help='max joint error to count as home [rad]')
+    parser.add_argument('--onset-tol', type=float, default=0.03,
+                        help='joint motion that starts the bag in human recording [rad] (record)')
     parser.add_argument('--udp-host', default='127.0.0.1')
     parser.add_argument('--udp-port', type=int, default=5005)
+    parser.add_argument('--plot', default=None, help='bar chart PNG (summary)')
     args = parser.parse_intermixed_args()  # allows `replay --wall BAG...`
     if args.out is None:
         args.out = '/home/ubuntu/pai2026-final-assignment/data/rosbags/' + ('so101_wall' if args.wall else 'so101_reach')
+    if args.mode == 'summary':
+        summary(args)
+        return
     if args.mode == 'fk':
         q = [float(v) for v in args.bags] + [0.0] * (6 - len(args.bags))
         print(np.round(fk(q), 4))
