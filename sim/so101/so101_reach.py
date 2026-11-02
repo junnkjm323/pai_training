@@ -21,7 +21,9 @@ Modes (run inside the container with ROS sourced, Gazebo + so101_leader_bridge.p
     summary LABEL=FILE...  success / wall-contact table (per target kind) from episodes.jsonl files,
                       --plot PNG for a bar chart (use one --out directory per evaluated method)
 
-Bags go to <out>/episode_XXX (sqlite3); one JSON line per episode is appended to <out>/episodes.jsonl.
+Each episode is recorded with `ros2 bag record -a` (as in lecture 5) to <out>/episode_XXX (sqlite3); the
+recorder starts paused and is un-paused when the episode starts. One JSON line per episode goes to
+<out>/episodes.jsonl.
 """
 
 import argparse
@@ -45,6 +47,8 @@ TIP_LINK = 'gripper_frame_link'
 HOME = [0.0] * 6
 WORLD = 'empty'
 MARKER = 'reach_target'
+MARKER_REACHED = 'reach_target_reached'  # red twin shown in place of the green marker once reached
+HIDDEN = (0.0, 0.0, -10.0)  # below the ground plane
 
 # Wall task. The wall stands between the tucked home pose and the far targets.
 WALL = 'reach_wall'
@@ -60,13 +64,6 @@ ARM_TOPIC = '/so101_arm_controller/joint_trajectory'
 GRIPPER_TOPIC = '/so101_gripper_controller/joint_trajectory'
 TARGET_TOPIC = '/reach_target'
 ACTIVE_TOPIC = '/reach_active'
-RECORD_TOPICS = {
-    '/joint_states': 'sensor_msgs/msg/JointState',
-    ARM_TOPIC: 'trajectory_msgs/msg/JointTrajectory',
-    GRIPPER_TOPIC: 'trajectory_msgs/msg/JointTrajectory',
-    '/leader/joint_states': 'sensor_msgs/msg/JointState',
-    TARGET_TOPIC: 'geometry_msgs/msg/PointStamped',
-}
 
 
 # ---------------------------------------------------------------- kinematics
@@ -286,16 +283,31 @@ def ign_service(service, reqtype, req):
 
 
 def spawn_marker(radius):
-    sdf = (f'<sdf version="1.6"><model name="{MARKER}"><static>true</static><link name="link">'
-           f'<visual name="v"><geometry><sphere><radius>{radius}</radius></sphere></geometry>'
-           '<material><ambient>0 1 0 0.6</ambient><diffuse>0 1 0 0.6</diffuse></material></visual>'
-           '</link></model></sdf>')
-    ign_service('create', 'ignition.msgs.EntityFactory', 'sdf: ' + json.dumps(sdf))
+    # Ignition Fortress has no service to recolour a visual, so a red twin is swapped in when reached.
+    for name, rgba, pose in ((MARKER, '0 1 0 0.6', (0, 0, 0)), (MARKER_REACHED, '1 0 0 0.8', HIDDEN)):
+        sdf = (f'<sdf version="1.6"><model name="{name}"><static>true</static>'
+               f'<pose>{pose[0]} {pose[1]} {pose[2]} 0 0 0</pose><link name="link">'
+               f'<visual name="v"><geometry><sphere><radius>{radius}</radius></sphere></geometry>'
+               f'<material><ambient>{rgba}</ambient><diffuse>{rgba}</diffuse></material></visual>'
+               '</link></model></sdf>')
+        ign_service('create', 'ignition.msgs.EntityFactory', 'sdf: ' + json.dumps(sdf))
+
+
+def set_model_position(name, p):
+    ign_service('set_pose', 'ignition.msgs.Pose',
+                f'name: "{name}", position: {{x: {p[0]}, y: {p[1]}, z: {p[2]}}}')
 
 
 def move_marker(p):
-    ign_service('set_pose', 'ignition.msgs.Pose',
-                f'name: "{MARKER}", position: {{x: {p[0]}, y: {p[1]}, z: {p[2]}}}')
+    """Show the (green) target at p."""
+    set_model_position(MARKER_REACHED, HIDDEN)
+    set_model_position(MARKER, p)
+
+
+def mark_reached(p):
+    """Turn the target red: swap the green marker for the red one."""
+    set_model_position(MARKER_REACHED, p)
+    set_model_position(MARKER, HIDDEN)
 
 
 def spawn_wall():
@@ -308,14 +320,66 @@ def spawn_wall():
     ign_service('create', 'ignition.msgs.EntityFactory', 'sdf: ' + json.dumps(sdf))
 
 
+# ---------------------------------------------------------------- rosbag2 recording
+
+class BagRecorder:
+    """`ros2 bag record -a` (as in lecture 5) for one episode. It is started paused, so it can subscribe
+    before the episode, and un-paused with the space key (its keyboard control in Humble, which has no
+    pause/resume service) at the moment the episode really starts; stopped with Ctrl+C (SIGINT)."""
+
+    active = []  # recorders not stopped yet; run() aborts them on exit, whatever interrupted us
+
+    def __init__(self, path, log_path='/tmp/so101_bag_record.log'):
+        import pty
+        self.path = path
+        self.master, slave = pty.openpty()  # the recorder only reads keys from a terminal
+        self.log = open(log_path, 'w')
+        self.proc = subprocess.Popen(['ros2', 'bag', 'record', '-a', '--start-paused', '-o', path],
+                                     stdin=slave, stdout=self.log, stderr=subprocess.STDOUT,
+                                     start_new_session=True)
+        BagRecorder.active.append(self)
+        os.close(slave)
+        deadline = time.time() + 15.0
+        while 'Press SPACE' not in open(log_path).read():
+            if self.proc.poll() is not None or time.time() > deadline:
+                raise RuntimeError(f'ros2 bag record did not start, see {log_path}')
+            time.sleep(0.05)
+
+    def resume(self):
+        os.write(self.master, b' ')
+
+    def stop(self):
+        import signal
+        self.proc.send_signal(signal.SIGINT)
+        self.proc.wait(timeout=30)
+        os.close(self.master)
+        self.log.close()
+        BagRecorder.active.remove(self)
+
+    def abort(self):
+        """Interrupted episode: kill the recorder without letting it write, and drop the partial bag.
+        (It runs in its own session, so Ctrl+C in the terminal does not reach it.)"""
+        import shutil
+        import signal
+        if self.proc.poll() is None:
+            os.killpg(self.proc.pid, signal.SIGKILL)
+            self.proc.wait(timeout=10)
+        os.close(self.master)
+        self.log.close()
+        if self in BagRecorder.active:
+            BagRecorder.active.remove(self)
+        shutil.rmtree(self.path, ignore_errors=True)
+        print(f'\nepisode aborted, {self.path} discarded', flush=True)
+
+
 # ---------------------------------------------------------------- ROS node
 
 def run(args):
     import rclpy
     from builtin_interfaces.msg import Duration
     from geometry_msgs.msg import PointStamped
+    from rclpy.executors import ExternalShutdownException
     from rclpy.node import Node
-    from rclpy.serialization import deserialize_message
     from sensor_msgs.msg import JointState
     from std_msgs.msg import Bool
     from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
@@ -324,30 +388,19 @@ def run(args):
         def __init__(self):
             super().__init__('so101_reach')
             self.q = None
-            self.writer = None
             self.target = None
             self.target_pub = self.create_publisher(PointStamped, TARGET_TOPIC, 10)
             self.active_pub = self.create_publisher(Bool, ACTIVE_TOPIC, 10)
             self.arm_pub = self.create_publisher(JointTrajectory, ARM_TOPIC, 10)
             self.gripper_pub = self.create_publisher(JointTrajectory, GRIPPER_TOPIC, 10)
-            # Raw subscriptions: bag the bytes exactly as received. Re-serializing in rclpy can leave
-            # trailing padding that the rosbags reader used by rosbag2lerobot.py rejects.
-            for topic, type_name in RECORD_TOPICS.items():
-                msg_type = {'sensor_msgs/msg/JointState': JointState,
-                            'trajectory_msgs/msg/JointTrajectory': JointTrajectory,
-                            'geometry_msgs/msg/PointStamped': PointStamped}[type_name]
-                self.create_subscription(msg_type, topic, lambda raw, t=topic: self.on_raw(t, raw), 50, raw=True)
+            self.create_subscription(JointState, '/joint_states', self.on_joint_states, 50)
             self.create_timer(0.05, self.publish_target)
             self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.seq = 0
 
-        def on_raw(self, topic, raw):
-            if topic == '/joint_states':
-                msg = deserialize_message(raw, JointState)
-                pos = dict(zip(msg.name, msg.position))
-                self.q = [pos.get(n, 0.0) for n in JOINT_NAMES]
-            if self.writer is not None:
-                self.writer.write(topic, raw, time.time_ns())
+        def on_joint_states(self, msg):
+            pos = dict(zip(msg.name, msg.position))
+            self.q = [pos.get(n, 0.0) for n in JOINT_NAMES]
 
         def publish_target(self):
             active = Bool(data=self.target is not None)
@@ -402,47 +455,77 @@ def run(args):
             t0 = time.time()
             inside_since = None
             collided = False
+            human = args.mode == 'record' and not args.demo
+            last_print = 0.0
             while time.time() - t0 < timeout:
                 if on_tick:
                     on_tick(time.time() - t0)
                 self.spin_for(0.05)
-                collided = collided or (args.wall and wall_collision(self.q))
+                touched = bool(args.wall and wall_collision(self.q))
+                if touched and not collided and human:
+                    print('\n  wall touched (this episode will not count as a success)', flush=True)
+                collided = collided or touched
                 err = self.tip_error()
+                if human and time.time() - last_print > 0.5:
+                    # Live feedback for the operator: distance of the gripper tip to the target centre.
+                    print(f'\r  distance {100 * err:5.1f} cm (goal < {100 * args.tol:.1f} cm)   ', end='', flush=True)
+                    last_print = time.time()
                 if err < args.tol:
                     inside_since = inside_since or time.time()
                     if time.time() - inside_since >= args.hold:
+                        print(('\n' if human else '') + 'Target reached.'
+                              + (' (but the wall was touched)' if collided else ''), flush=True)
+                        mark_reached(self.target)
                         return not collided, inside_since - t0, err, collided
                 else:
                     inside_since = None
+            if human:
+                print(f'\nTimeout: not reached (distance {100 * self.tip_error():.1f} cm)', flush=True)
             return False, None, self.tip_error(), collided
 
-        def open_bag(self, path):
-            import rosbag2_py
-            self.writer = rosbag2_py.SequentialWriter()
-            self.writer.open(rosbag2_py.StorageOptions(uri=path, storage_id='sqlite3'),
-                             rosbag2_py.ConverterOptions('cdr', 'cdr'))
-            for topic, type_name in RECORD_TOPICS.items():
-                self.writer.create_topic(rosbag2_py.TopicMetadata(
-                    name=topic, type=type_name, serialization_format='cdr'))
-
-        def close_bag(self):
-            writer, self.writer = self.writer, None
-            del writer  # the sqlite3 file is finalized when the writer is destroyed
-
-    rclpy.init()
+    # No rclpy SIGINT handler: Ctrl+C then raises KeyboardInterrupt wherever we are, so an interrupted
+    # episode is cleaned up (recorder killed, partial bag removed) instead of failing inside spin_once.
+    import signal
+    from rclpy.signals import SignalHandlerOptions
+    signal.signal(signal.SIGINT, signal.default_int_handler)  # also when launched with SIGINT ignored
+    rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
     node = Reach()
     node.wait_joint_states()
+    home_file = os.path.join(args.out, 'home_pose.json')
+    if args.home == 'current' and args.mode == 'record' and os.path.exists(home_file):
+        # Resuming into the same directory: keep the home the earlier episodes used.
+        args.home = home_file
+        print(f'using the home saved in {home_file} (delete it to capture a new one)', flush=True)
+    if args.home == 'current':
+        # Use the pose the (leader) arm is in right now as home for every episode, and save it next to
+        # the bags so that later runs (resume, eval) start from the same pose.
+        args.home_q = [round(v, 3) for v in node.q[:5]] + [0.0]
+        if args.mode == 'record':
+            os.makedirs(args.out, exist_ok=True)
+            with open(home_file, 'w') as f:
+                json.dump({'home': args.home_q[:5], 'joint_names': ARM_JOINTS,
+                           'captured_at': time.strftime('%Y-%m-%d %H:%M:%S')}, f, indent=2)
+            print(f'home saved to {home_file}', flush=True)
+    elif args.home and args.home.endswith('.json'):
+        args.home_q = json.load(open(args.home))['home'][:5] + [0.0]
+    elif args.home:
+        args.home_q = [float(v) for v in args.home.split(',')][:5] + [0.0]
+    if args.home_q is not None:
+        print('home pose: --home ' + ','.join(f'{v:.3f}' for v in args.home_q[:5])
+              + '  (use the same --home for eval)', flush=True)
     spawn_marker(args.tol)
     if args.wall:
         spawn_wall()
     try:
         {'record': record, 'eval': evaluate, 'replay': replay}[args.mode](node, args)
-    except KeyboardInterrupt:
-        pass
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass  # Ctrl+C: rclpy shuts its context down, so only clean up below
     finally:
+        for recorder in list(BagRecorder.active):
+            recorder.abort()
         node.target = None
-        node.publish_target()
-        node.close_bag()
+        if rclpy.ok():
+            node.publish_target()  # /reach_active false: a running policy stops acting
         node.destroy_node()
         rclpy.try_shutdown()
 
@@ -460,6 +543,8 @@ def next_episode_index(out):
 
 
 def home_pose(args):
+    if args.home_q is not None:
+        return args.home_q
     return HOME_WALL if args.wall else HOME
 
 
@@ -518,32 +603,46 @@ def record(node, args):
     start = next_episode_index(args.out)
     for ep in range(start, start + args.episodes):
         go_home(node, args)
-        q_goal, target, kind, waypoints = pick_target(rng, args)
-        move_marker(target)
-        node.target = target
         path = os.path.join(args.out, f'episode_{ep:03d}')
-        onset = 0.0
-        if not args.demo:
-            # A human reacts ~0.5 s after the target appears. Start the bag only once the leader moves,
-            # so the episode does not begin with a pause (the policy would learn to wait at home).
-            print(f'episode {ep}: target shown, move when ready')
-            t_show, q_show = time.time(), list(node.q)
-            while max(abs(a - b) for a, b in zip(node.q[:5], q_show[:5])) < args.onset_tol:
-                node.spin_for(0.02)
-            onset = time.time() - t_show
-        node.open_bag(path)
-        on_tick = None
-        if args.demo:
-            # Start right away and never pause: stops in demos are learned as stops (lecture 5).
-            traj = demo_trajectory(node.q, waypoints, segment_durations(rng, waypoints))
-            on_tick = lambda t: node.send_leader(traj(t))
-        ok, t_reach, err, collided = node.wait_success(args.timeout, on_tick)
-        node.spin_for(0.5)  # keep a little of the settled pose in the bag
-        node.close_bag()
+        os.makedirs(args.out, exist_ok=True)
+        recorder = BagRecorder(path)  # paused until the episode starts
+        try:
+            ok, t_reach, err, collided, kind, waypoints, target, onset = record_episode(node, args, rng, ep, recorder)
+        except BaseException:
+            recorder.abort()
+            raise
+        recorder.stop()
         node.target = None
         log_episode(args.out, {'episode': ep, 'bag': path, 'demo': args.demo, 'kind': kind, 'onset_delay': onset,
+                               'home': home_pose(args)[:5],
                                'via_point': len(waypoints) > 1, 'target': list(map(float, target)),
                                'success': ok, 'collided': collided, 'time_to_reach': t_reach, 'final_error': err})
+
+
+def record_episode(node, args, rng, ep, recorder):
+    """Show a target, start the paused recorder when the motion starts, wait for the outcome."""
+    q_goal, target, kind, waypoints = pick_target(rng, args)
+    move_marker(target)
+    node.target = target
+    node.spin_for(0.2)  # let /reach_target go out before the bag starts
+    onset = 0.0
+    if not args.demo:
+        # A human reacts ~0.5 s after the target appears. Start the bag only once the leader moves,
+        # so the episode does not begin with a pause (the policy would learn to wait at home).
+        print(f'episode {ep}: target shown, move when ready')
+        t_show, q_show = time.time(), list(node.q)
+        while max(abs(a - b) for a, b in zip(node.q[:5], q_show[:5])) < args.onset_tol:
+            node.spin_for(0.02)
+        onset = time.time() - t_show
+    recorder.resume()
+    on_tick = None
+    if args.demo:
+        # Start right away and never pause: stops in demos are learned as stops (lecture 5).
+        traj = demo_trajectory(node.q, waypoints, segment_durations(rng, waypoints))
+        on_tick = lambda t: node.send_leader(traj(t))
+    ok, t_reach, err, collided = node.wait_success(args.timeout, on_tick)
+    node.spin_for(0.5)  # keep a little of the settled pose in the bag
+    return ok, t_reach, err, collided, kind, waypoints, target, onset
 
 
 def evaluate(node, args):
@@ -564,7 +663,7 @@ def evaluate(node, args):
         node.target = None
         node.spin_for(0.2)
         results.append((ok, collided))
-        log_episode(args.out, {'eval_episode': ep, 'baseline': args.baseline, 'kind': kind,
+        log_episode(args.out, {'eval_episode': ep, 'baseline': args.baseline, 'kind': kind, 'home': home_pose(args)[:5],
                                'target': list(map(float, target)), 'success': ok, 'collided': collided,
                                'time_to_reach': t_reach, 'final_error': err})
     print(f'success rate: {sum(ok for ok, _ in results)}/{len(results)}, '
@@ -695,12 +794,17 @@ def main():
     parser.add_argument('--hold', type=float, default=0.5, help='time to stay within tol [s]')
     parser.add_argument('--timeout', type=float, default=15.0, help='episode timeout [s]')
     parser.add_argument('--home-tol', type=float, default=0.15, help='max joint error to count as home [rad]')
+    parser.add_argument('--home', default=None,
+                        help="home pose: 'current' (the arm's pose at start; record saves it to <out>/home_pose.json "
+                             'and reuses that file when resuming), a home_pose.json path, or 5 joint values a,b,c,d,e '
+                             '[rad]; default: all zeros (wall task: tucked pose)')
     parser.add_argument('--onset-tol', type=float, default=0.03,
                         help='joint motion that starts the bag in human recording [rad] (record)')
     parser.add_argument('--udp-host', default='127.0.0.1')
     parser.add_argument('--udp-port', type=int, default=5005)
     parser.add_argument('--plot', default=None, help='bar chart PNG (summary)')
     args = parser.parse_intermixed_args()  # allows `replay --wall BAG...`
+    args.home_q = None
     if args.out is None:
         args.out = '/home/ubuntu/pai2026-final-assignment/data/rosbags/' + ('so101_wall' if args.wall else 'so101_reach')
     if args.mode == 'summary':

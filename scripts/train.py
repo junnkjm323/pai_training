@@ -122,6 +122,7 @@ def main():
 
     step = 0
     done = False
+    losses = []
     while not done:
         for batch in dataloader:
             batch = {k: (v.to(DEVICE) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
@@ -130,6 +131,7 @@ def main():
             batch["observation.environment_state"] = batch["observation.environment_state"][:, -1, :]  # (B, D)
             # action is left as is
             loss, _ = policy.forward(batch)
+            losses.append(loss.item())
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
@@ -144,7 +146,31 @@ def main():
 
     policy.save_pretrained(OUTPUT_DIRECTORY)
     print(f"policy saved to {OUTPUT_DIRECTORY}")
+    save_loss_curve(losses, OUTPUT_DIRECTORY)
     wandb.finish()
+
+def save_loss_curve(losses, output_directory: Path):
+    """Write loss.csv and loss.png (raw loss and moving average, log scale) next to the saved policy."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    with open(output_directory / "loss.csv", "w") as f:
+        f.write("step,loss\n")
+        f.writelines(f"{i},{v}\n" for i, v in enumerate(losses))
+    window = max(1, len(losses) // 50)
+    smooth = np.convolve(losses, np.ones(window) / window, mode="valid")
+    fig, ax = plt.subplots(figsize=(6, 3.5))
+    ax.plot(losses, alpha=0.3, linewidth=0.8, label="loss")
+    ax.plot(np.arange(window - 1, len(losses)), smooth, linewidth=1.5, label=f"moving average ({window} steps)")
+    ax.set_yscale("log")
+    ax.set_xlabel("step")
+    ax.set_ylabel("loss")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_directory / "loss.png", dpi=150)
+    print(f"loss curve saved to {output_directory / 'loss.png'}")
 
 if __name__ == "__main__":
     main()
